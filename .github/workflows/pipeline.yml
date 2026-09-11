@@ -40,7 +40,37 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add recent_strikes.json
-          git diff --cached --quiet && echo "No change in strike data" && exit 0
-          git commit -m "chore: update recent_strikes.json [skip ci]"
-          git push
+
+          # This job is triggered externally roughly every 60s (meteoscience-api's
+          # trigger-pipeline.js), well under the concurrency group's cancellation
+          # latency -- a run already at "git push" can still land a fraction of a
+          # second before an overlapping run is actually killed, producing a real
+          # "fetch first" rejection (seen live 2026-09-11T19:46 UTC).
+          #
+          # recent_strikes.json is fully regenerated every run (not incrementally
+          # patched), so on a rejected push there is nothing to reconcile -- the
+          # data we just fetched is always the freshest available and should just
+          # be recommitted on top of whatever the remote tip has moved to,
+          # avoiding any merge/rebase conflict machinery entirely.
+          cp recent_strikes.json /tmp/latest_strikes.json
+
+          for attempt in 1 2 3 4 5; do
+            git add recent_strikes.json
+            if git diff --cached --quiet; then
+              echo "No change in strike data"
+              exit 0
+            fi
+            git commit -m "chore: update recent_strikes.json [skip ci]"
+
+            if git push; then
+              exit 0
+            fi
+
+            echo "push rejected (attempt $attempt), fetching latest remote state and recommitting our data..."
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/latest_strikes.json recent_strikes.json
+          done
+
+          echo "::error::git push failed after 5 attempts"
+          exit 1
